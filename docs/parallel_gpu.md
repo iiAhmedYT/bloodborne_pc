@@ -545,6 +545,12 @@ G-buffer target; two 960x540 targets): 8 dispatches, and each needs the image do
 the buffer, the proxy resolved and the destination image uploaded again. Recognizing copies
 whose source is an image and turning them into image copies (or a proxy-sized copy) would remove
 most of that. Skipping the dispatches blacks out the scene, so the copies are needed.
+The Vulkan rasterizer now recognizes the shader's raw-buffer dword memcpys when both aliases have
+the same image layout, replacing the dispatch with a native image copy. Set the `RawImageCopies`
+runtime toggle (`1 << 56`) to disable this path for A/B testing or if a title uses a different
+raw-buffer copy pattern.
+With `BB_GPU_PROFILE=1`, successful matches appear as `native raw image copy`; compare that
+label and its segment count with the guest `3d5ebf4e` dispatch time when testing the toggle.
 
 ### Fixed: guest heap corruption with the draw pipeline (2026-10-01)
 

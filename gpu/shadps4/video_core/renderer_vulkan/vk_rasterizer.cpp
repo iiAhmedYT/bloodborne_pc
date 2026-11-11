@@ -2009,10 +2009,13 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
         return false;
     }
 
-    // Those 2 buffers must both be formatted. One must be source and another destination.
+    // One must be source and another destination. Raw buffers are accepted only for the
+    // strict same-layout case below: the scene copy shader uses them as a dword memcpy.
     const auto& desc0 = info.buffers[0];
     const auto& desc1 = info.buffers[1];
-    if (!desc0.is_formatted || !desc1.is_formatted || desc0.is_written == desc1.is_written) {
+    if (desc0.is_written == desc1.is_written ||
+        desc0.is_formatted != desc1.is_formatted ||
+        (!desc0.is_formatted && BbToggle::Disabled(BbToggle::RawImageCopies))) {
         return false;
     }
 
@@ -2039,13 +2042,25 @@ bool Rasterizer::IsComputeImageCopy(const Pipeline* pipeline) {
     VideoCore::Image& image1 = texture_cache.GetImage(image1_id);
     if (image0.info.guest_size != image1.info.guest_size ||
         image0.info.pitch != image1.info.pitch || image0.info.guest_size != buf0.GetSize() ||
-        image0.info.num_bits != image1.info.num_bits) {
+        image0.info.num_bits != image1.info.num_bits ||
+        (!desc0.is_formatted &&
+         (image0.info.pixel_format != image1.info.pixel_format ||
+          image0.info.size != image1.info.size || image0.info.type != image1.info.type ||
+          image0.info.resources != image1.info.resources ||
+          image0.info.num_samples != image1.info.num_samples ||
+          image0.info.tile_mode != image1.info.tile_mode ||
+          image0.info.array_mode != image1.info.array_mode ||
+          image0.info.props.is_tiled != image1.info.props.is_tiled ||
+          image0.info.props.is_block != image1.info.props.is_block))) {
         return false;
     }
 
     // Perform image copy
     VideoCore::Image& src_image = desc0.is_written ? image1 : image0;
     VideoCore::Image& dst_image = desc0.is_written ? image0 : image1;
+    if (auto* profiler = GpuProfiler::Get()) {
+        profiler->Mark(0xC0B2ull, [] { return std::string{"native raw image copy"}; });
+    }
     runtime.CopyColorAndDepth(&src_image, &dst_image);
     return true;
 }

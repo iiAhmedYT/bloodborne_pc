@@ -60,6 +60,7 @@ enum : std::uint64_t {
     OrderedGuestWrites = 1ull << 49,
     GcRelievable = 1ull << 59, ///< eviction marks count only where evicting textures can relieve them
     SceneHalfRes = 1ull << 50, ///< live scaling also reduces the 960x540 post targets
+    RawImageCopies = 1ull << 56, ///< raw buffer image-copy HLE (same-layout copies only)
     UpdateImageFastPath = 1u << 30,
     // TAA A/B in one run: optional techniques, off by default (no measured gain, 2026-10-02).
     TaaTonemapBlend = 1ull << 51,
