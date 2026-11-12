@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
 #include <chrono>
+#include <cstring>
 #include <pthread.h>
 #ifndef _WIN32
 #include <sys/resource.h>
@@ -27,6 +28,7 @@
 #include "video_core/amdgpu/pm4_cmds.h"
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
+#include "video_core/renderer_vulkan/vk_occlusion.h"
 
 namespace AmdGpu {
 
@@ -357,6 +359,19 @@ void RunZpassDump(Vulkan::Rasterizer& rasterizer, const u8* data) {
     auto* results = reinterpret_cast<u64*>(dump.address);
     for (u32 i = 0; i < dump.pairs; ++i, results += 2) {
         *results = dump.value;
+    }
+
+    void RunOcclusionDump(Vulkan::Rasterizer& rasterizer, const u8* data) {
+        if (auto* occlusion = rasterizer.GetOcclusion()) {
+            occlusion->Dump(*reinterpret_cast<const Vulkan::Occlusion::DumpTask*>(data));
+        }
+    }
+
+    void RunSetPredication(Vulkan::Rasterizer& rasterizer, const u8* data) {
+        if (auto* occlusion = rasterizer.GetOcclusion()) {
+            occlusion->SetPredication(
+                *reinterpret_cast<const Vulkan::Occlusion::PredicationTask*>(data));
+        }
     }
 }
 
@@ -946,7 +961,15 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                 break; // registers: ApplyGraphicsRegisterPacket
             }
             case PM4ItOpcode::SetPredication: {
-                LOG_WARNING(Render, "Unimplemented IT_SET_PREDICATION");
+                const auto* pred = reinterpret_cast<const u32*>(header);
+                Vulkan::Occlusion::PredicationTask task{};
+                task.block = (u64(pred[2] & 0xFFFF) << 32) | (pred[1] & ~0xFu);
+                task.op = (pred[2] >> 24) & 7;
+                task.draw_if_visible = ((pred[2] >> 16) & 1) == 0;
+                task.cont = (pred[2] >> 31) & 1;
+                if (rasterizer && rasterizer->GetOcclusion()) {
+                    rasterizer->RunInOrder(&RunSetPredication, &task, sizeof(task));
+                }
                 break;
             }
             case PM4ItOpcode::IndexType: {
@@ -1155,6 +1178,12 @@ Liverpool::Task Liverpool::ProcessGraphics(std::span<const u32> dcb, std::span<c
                     // registers: ApplyGraphicsRegisterPacket
                 } else if (event->event_index.Value() == EventIndex::ZpassDone) {
                     if (event->event_type.Value() == EventType::PixelPipeStatDump) {
+                        if (rasterizer && rasterizer->GetOcclusion()) {
+                            const auto task = rasterizer->GetOcclusion()->MakeDump(
+                                event->Address<VAddr>(), num_counter_pairs);
+                            rasterizer->RunInOrder(&RunOcclusionDump, &task, sizeof(task));
+                            break;
+                        }
                         static constexpr u64 OcclusionCounterValidMask = 0x8000000000000000ULL;
                         static constexpr u64 OcclusionCounterStep = 0x2FFFFFFULL;
                         const ZpassDump dump{event->Address<u64>(),

@@ -16,6 +16,7 @@
 #include "video_core/renderer_vulkan/vk_object_motion.h"
 #include "video_core/renderer_vulkan/vk_draw_pipe.h"
 #include "video_core/renderer_vulkan/vk_draw_prep.h"
+#include "video_core/renderer_vulkan/vk_occlusion.h"
 #include "video_core/renderer_vulkan/vk_temporal_upscaler.h"
 #include "video_core/renderer_vulkan/vk_pipeline_cache.h"
 #include "video_core/renderer_vulkan/vk_scheduler.h"
@@ -126,6 +127,14 @@ public:
     /// Before a guest-visible write: fences deferred earlier are written first.
     void WaitDeferredSignals() {
         scheduler.WaitDeferredSignals();
+    }
+    Occlusion* GetOcclusion() const noexcept {
+        return occlusion.get();
+    }
+    void NoteIssuedDraw() {
+        if (occlusion) {
+            occlusion->NoteIssued();
+        }
     }
     /// Runs `signal` after the guest memory copies issued so far, without waiting here.
     void SignalAfterHostCopies(std::function<void()> signal) {
@@ -530,6 +539,7 @@ private:
         return nullptr;
     }
     std::unique_ptr<ConstantRing> constant_ring;
+    std::unique_ptr<Occlusion> occlusion;
     /// Submissions (prepared draws) kept alive until stage B reaches the position.
     std::deque<std::pair<u64, std::shared_ptr<const void>>> pipe_keepalive;
     std::unique_ptr<DrawPipe> draw_pipe;

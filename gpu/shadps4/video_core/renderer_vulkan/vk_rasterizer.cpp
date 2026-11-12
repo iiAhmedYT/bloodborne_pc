@@ -73,6 +73,7 @@ Rasterizer::Rasterizer(const Instance& instance_, Scheduler& scheduler_, Runtime
     camera_motion->SetObjectMotion(object_motion.get());
     upscaler = std::make_unique<TemporalUpscaler>(instance, scheduler, texture_cache, runtime,
                                                   *camera_motion, *scene_targets);
+    occlusion = Occlusion::Create(instance, scheduler, *this);
     if (!EmulatorSettings.IsNullGPU()) {
         liverpool->BindRasterizer(this);
     }
@@ -936,6 +937,7 @@ void Rasterizer::Draw(bool is_indexed, u32 index_offset, const PreparedDraw* pre
     RENDERER_TRACE;
     MaybeSubmitEarly();
     BbStats::draws.fetch_add(1, std::memory_order_relaxed);
+    NoteIssuedDraw();
 
     // bbport: with the draw pipeline this thread only selects the pipeline and hands the draw
     // to the recording thread (DrawRecord there); draws FilterDraw handles itself run here.
@@ -1168,6 +1170,15 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 
+    Occlusion::DrawQuery query{};
+    if (occlusion) {
+        if (occlusion->SkipDraw()) {
+            ResetBindings(false);
+            return;
+        }
+        query = occlusion->BeginDraw(push_data.scene_size);
+    }
+
     const vk::Pipeline handle = pipeline->Handle();
     const u32 num_indices = regs.num_indices;
     const u32 num_instances = regs.num_instances.NumInstances();
@@ -1177,6 +1188,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     const u32 checkpoint = Checkpoints::Note("draw vs/ps/indices", vs_info.pgm_hash,
                                        marked_ps ? marked_ps->pgm_hash : 0, num_indices);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+        if (query.pool) {
+            cmdbuf.beginQuery(query.pool, query.index, query.flags);
+        }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         Checkpoints::Start(cmdbuf, checkpoint);
         if (is_indexed) {
@@ -1185,6 +1199,9 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             cmdbuf.draw(num_indices, num_instances, first_vertex, first_instance);
         }
         Checkpoints::Finish(cmdbuf, checkpoint);
+        if (query.pool) {
+            cmdbuf.endQuery(query.pool, query.index);
+        }
     });
     if (FrameCapture::Active()) {
         const auto* ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
@@ -1210,6 +1227,7 @@ void Rasterizer::DrawIndirect(bool is_indexed, VAddr arg_address, u32 offset, u3
                               u16 instance_sgpr_offset) {
     RENDERER_TRACE;
     MaybeSubmitEarly();
+    NoteIssuedDraw();
     // bbport: like direct draws, handed to the recording thread after the pipeline selection
     // (else the GPU thread waited here for a whole frame of queued draws).
     const bool pipelined = UseDrawPipe() && FilterDrawPasses() &&
@@ -1302,6 +1320,15 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
 
+    Occlusion::DrawQuery query{};
+    if (occlusion) {
+        if (occlusion->SkipDraw()) {
+            ResetBindings(false);
+            return;
+        }
+        query = occlusion->BeginDraw(push_data.scene_size);
+    }
+
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
     const vk::Pipeline handle = pipeline->Handle();
@@ -1314,6 +1341,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
                                        pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
                                        marked_ps ? marked_ps->pgm_hash : 0, max_count);
     scheduler.Record([=](vk::CommandBuffer cmdbuf) {
+        if (query.pool) {
+            cmdbuf.beginQuery(query.pool, query.index, query.flags);
+        }
         cmdbuf.bindPipeline(vk::PipelineBindPoint::eGraphics, handle);
         Checkpoints::Start(cmdbuf, checkpoint);
         if (is_indexed) {
@@ -1329,6 +1359,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
             cmdbuf.drawIndirect(args, args_offset, max_count, stride);
         }
         Checkpoints::Finish(cmdbuf, checkpoint);
+        if (query.pool) {
+            cmdbuf.endQuery(query.pool, query.index);
+        }
     });
     DebugState.IncDrawCall();
 
