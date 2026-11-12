@@ -173,10 +173,20 @@ struct Info : InfoPersistent {
     static constexpr u32 MaxUdSnapshots = 6;
     static inline thread_local UdSnapshot ud_snapshots[MaxUdSnapshots];
     static inline thread_local u32 num_ud_snapshots = 0;
+    /// Index of the snapshot Snapshot() returned last. A draw reads the same stage many times
+    /// (every sharp fetch and user-data register), and this makes the common case one compare.
+    /// It is only a hint: the slot is re-validated against the live array on every use, so a
+    /// stale index cannot return another draw's data.
+    static inline thread_local u32 ud_snapshot_hint = 0;
 
     const UdSnapshot* Snapshot() const noexcept {
-        for (u32 i = 0; i < num_ud_snapshots; ++i) {
+        const u32 count = num_ud_snapshots;
+        if (ud_snapshot_hint < count && ud_snapshots[ud_snapshot_hint].info == this) {
+            return &ud_snapshots[ud_snapshot_hint];
+        }
+        for (u32 i = 0; i < count; ++i) {
             if (ud_snapshots[i].info == this) {
+                ud_snapshot_hint = i;
                 return &ud_snapshots[i];
             }
         }

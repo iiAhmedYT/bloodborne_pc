@@ -183,13 +183,19 @@ VideoCore::ImageId Rasterizer::FindTargetMemoized(VideoCore::TextureCache::Image
                                                   LastTarget& last, auto&& make_desc,
                                                   const Parts&... parts) {
     static_assert((sizeof(Parts) + ...) <= 256, "target memo key too large");
-    std::array<u8, 256> key{};
+    // Only the first key_size bytes are written and compared (the word-wise hash below reads
+    // whole words, so its last one is padded). Zero-filling all 256 bytes for up to nine targets
+    // per draw was a visible share of the draw recording thread's time.
+    std::array<u8, 256> key;
     u32 key_size = 0;
     const auto append = [&](const auto& part) {
         std::memcpy(key.data() + key_size, &part, sizeof(part));
         key_size += sizeof(part);
     };
     (append(parts), ...);
+    if (const u32 tail = (8 - (key_size & 7)) & 7; tail != 0) {
+        std::memset(key.data() + key_size, 0, tail);
+    }
     const u64 generation = texture_cache.RegistryGeneration();
     const bool memo_enabled = !BbToggle::Disabled(BbToggle::TextureBindingMemo);
     if (memo_enabled && last.generation == generation && last.key_size == key_size &&
@@ -198,7 +204,7 @@ VideoCore::ImageId Rasterizer::FindTargetMemoized(VideoCore::TextureCache::Image
         return last.image_id;
     }
     const auto remember = [&](VideoCore::ImageId image_id) {
-        last.key = key;
+        std::memcpy(last.key.data(), key.data(), key_size);
         last.key_size = key_size;
         last.generation = generation;
         last.image_id = image_id;
@@ -221,7 +227,7 @@ VideoCore::ImageId Rasterizer::FindTargetMemoized(VideoCore::TextureCache::Image
     make_desc();
     const VideoCore::ImageId image_id = texture_cache.FindImage(desc);
     if (generation == texture_cache.RegistryGeneration()) {
-        memo.key = key;
+        std::memcpy(memo.key.data(), key.data(), key_size);
         memo.key_size = key_size;
         memo.generation = generation;
         memo.image_id = image_id;
@@ -2636,8 +2642,11 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
             return false;
         }
     }
-    u64 key = XXH3_64bits_withSeed(prepared->image_hashes, count * sizeof(u64),
-                                   reinterpret_cast<u64>(&stage));
+    // The description hashes were hashed once by the draw-preparation worker
+    // (PreparedStage::image_hashes_key); this used to re-run XXH3 over the array for every stage
+    // of every draw, hit or miss. Mixing in the stage keeps two stages with equal hashes apart.
+    u64 key = prepared->image_hashes_key ^
+              (reinterpret_cast<u64>(&stage) * 0x9E3779B97F4A7C15ull);
     key |= 1; // 0 marks an empty slot
     auto& set = texture_sets[key % texture_sets.size()];
     slot = &set;

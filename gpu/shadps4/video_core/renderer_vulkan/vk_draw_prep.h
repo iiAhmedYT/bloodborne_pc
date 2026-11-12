@@ -42,6 +42,9 @@ struct PreparedStage {
     // GPU thread exactly when `flat` matched: sharps depend on nothing else.
     const AmdGpu::Image* image_sharps;
     const u64* image_hashes;
+    /// XXH3 of `image_hashes`, computed by the worker: the GPU thread's texture-set memo key,
+    /// instead of re-hashing the array for every stage of every draw.
+    u64 image_hashes_key;
     const AmdGpu::Sampler* sampler_sharps;
     const AmdGpu::Buffer* buffer_sharps;
     u32 num_images, num_samplers, num_buffers;
