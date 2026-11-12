@@ -1011,6 +1011,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                          UiComposition::NativeViewport(viewport.xscale * 2, viewport.yscale * 2));
     }
     const PreparedDraw* draw_prepared = bind_prepared;
+    // bbport: the object-motion palette scan below needs the vertex stage's buffer sharps,
+    // which the draw-preparation worker already fetched for this draw. Keep them, rather than
+    // reading the same user data again after BindResources drops the prepared draw.
+    const PreparedStage* vs_prepared =
+        motion_draw ? FindPreparedStage(pipeline->GetStage(Shader::SwStage::Vertex)) : nullptr;
     // bbport: vertex and index buffers are resolved while the helper binds textures (their
     // commands are recorded after BeginRendering, as before).
     draw_inputs = {pipeline, draw_prepared, index_offset, is_indexed, true, false};
@@ -1059,10 +1064,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             return value && value[0] == '1';
         }();
         bool gated = !all_motion;
+        bool small = false; // a small-skeleton palette was found and hashed
         u64 palette = 0;
-        for (const auto& resource : vs.buffers) {
+        for (u32 i = 0; i < vs.buffers.size(); ++i) {
+            const auto& resource = vs.buffers[i];
             if (resource.IsSpecial()) continue;
-            const auto buffer = resource.GetSharp(vs);
+            const auto buffer =
+                vs_prepared ? vs_prepared->buffer_sharps[i] : resource.GetSharp(vs);
             const u32 size = buffer.GetSize();
             if (!buffer.Valid() || buffer.GetStride() != 16) continue;
             const auto role = Motion::ClassifyBuffer(size);
@@ -1074,18 +1082,32 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
             if (role == Motion::BufferRole::SmallSkeleton &&
                 memory->IsValidGpuMapping(address, 0) &&
                 memory->ClampRangeSize(address, size) == size) {
+                small = true;
                 palette = XXH3_64bits_withSeed(reinterpret_cast<const void*>(address), size,
                                                palette);
             }
         }
         push_data.motion_param = 0;
-        if (!gated || object_motion->Moving({.shader = vs.pgm_hash,
-                                             .geometry = motion_geometry,
-                                             .indices = index_address,
-                                             .index_count = regs.num_indices,
-                                             .instances = regs.num_instances.NumInstances(),
-                                             .first_instance = first_instance},
-                                            palette)) {
+        // A gated draw with no small-skeleton buffer has no palette: it stays 0, so the gate
+        // can never see a change and the draw is never stored. Those are most gated draws (the
+        // static world), and they skip the per-frame gate tables instead of adding three
+        // entries to them every frame. That is the same "not seen last frame, no comparison"
+        // state the gate already handles for a draw that missed a frame.
+        bool moved = !gated;
+        if (!moved) {
+            if (small) {
+                moved = object_motion->Moving({.shader = vs.pgm_hash,
+                                               .geometry = motion_geometry,
+                                               .indices = index_address,
+                                               .index_count = regs.num_indices,
+                                               .instances = regs.num_instances.NumInstances(),
+                                               .first_instance = first_instance},
+                                              palette);
+            } else {
+                object_motion->Still();
+            }
+        }
+        if (moved) {
             Motion::VertexRange range{base_vertex, regs.num_indices};
             u64 topology = 0;
             if (is_indexed) {

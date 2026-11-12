@@ -35,6 +35,11 @@ public:
     bool Moving(const Motion::History::GateKey& key, u64 palette) {
         return history.Moving(key, palette);
     }
+    /// A gated draw with no small-skeleton palette: it can never report a change, so the
+    /// caller skips the gate entirely. Counted so the `still` diagnostic stays correct.
+    void Still() {
+        history.Still();
+    }
     /// Index range and topology hash of an indexed draw, reused across frames.
     template <class Scan>
     Motion::IndexRangeCache::Result IndexRange(const Motion::IndexRangeCache::Key& key,

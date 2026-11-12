@@ -510,7 +510,16 @@ than stage B, and removing drains helps only where it breaks the lockstep; stage
 
 Object motion vectors cost ~10% FPS (155 vs 141 FPS with `object_motion=0`): stage B spends
 ~0.28 µs more per packet, spread over DrawRecord (bone palette hashes, index range cache, motion
-pipeline variants).
+pipeline variants). The palette scan re-read each vertex-stage buffer sharp on the recording
+thread (`resource.GetSharp`); it now takes them from the draw-preparation worker
+(`PreparedStage::buffer_sharps`, as in `BindBuffers`). The gate probed three per-frame tables per
+gated draw (an occurrence counter, last frame's palette, this frame's palette); the counter now
+comes from this frame's table itself, since only a repeated draw identity in the same frame needs
+it, so a still draw costs one insert and one lookup instead of three probes. A gated draw whose
+vertex stage has no palette at all (no small-skeleton buffer, or one that is not fully mapped) is
+not entered into the tables: its palette is the constant 0, so the gate can never report a change
+for it — the same "no previous frame, no comparison" state it already has for a draw that missed
+a frame.
 
 ### Scene resolution and the preset/GPU load question
 

@@ -124,12 +124,14 @@ public:
     Value& operator[](const Key& key) {
         return Insert(key).first->value;
     }
-    /// Inserts `value` when `key` is absent (like std::unordered_map::emplace).
-    void emplace(const Key& key, const Value& value) {
+    /// Inserts `value` when `key` is absent (like std::unordered_map::emplace). Returns whether
+    /// the key was new.
+    bool emplace(const Key& key, const Value& value) {
         const auto [slot, inserted] = Insert(key);
         if (inserted) {
             slot->value = value;
         }
+        return inserted;
     }
     const Value* find(const Key& key) const {
         const size_t mask = slots.size() - 1;
@@ -242,13 +244,22 @@ public:
     };
     bool Moving(GateKey key, uint64_t palette) {
         key.occurrence = 0;
-        key.occurrence = gate_occurrences[key]++;
+        // This frame's table doubles as the occurrence counter: an identity that is already in
+        // it was seen earlier in this frame, and only a repeat needs the count. A separate
+        // counter table would hold an entry for every gated draw, every frame.
+        if (!gate_current.emplace(key, palette)) {
+            key.occurrence = ++gate_occurrences[key];
+            gate_current[key] = palette;
+        }
         const auto* prev = gate_previous.find(key);
         const bool moving = prev && *prev != palette;
-        gate_current.emplace(key, palette);
         stats.still += moving ? 0 : 1;
         return moving;
     }
+
+    /// A gated draw with no palette at all: it cannot move and the caller did not add it to
+    /// the tables. Counted so `still` (printed with the other statistics) stays complete.
+    void Still() { ++stats.still; }
 
     void NextFrame() {
         previous.swap(current);
