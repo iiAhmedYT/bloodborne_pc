@@ -1,0 +1,171 @@
+name: Windows GPU build
+
+on:
+  push:
+    tags:
+      - "v*"
+    paths:
+      - ".github/workflows/windows-build.yml"
+      - "build.sh"
+      - "gpu/**"
+      - "launcher/**"
+      - "packaging/windows/**"
+      - "scripts/**"
+      - "tests/**"
+  pull_request:
+    paths:
+      - ".github/workflows/windows-build.yml"
+      - "build.sh"
+      - "gpu/**"
+      - "launcher/**"
+      - "packaging/windows/**"
+      - "scripts/**"
+      - "tests/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Set up MSYS2 CLANG64
+        id: msys2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            git
+            patch
+            mingw-w64-clang-x86_64-toolchain
+            mingw-w64-clang-x86_64-libc++
+            mingw-w64-clang-x86_64-libunwind
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-pkgconf
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-vulkan-headers
+            mingw-w64-clang-x86_64-vulkan-loader
+            mingw-w64-clang-x86_64-vulkan-memory-allocator
+            mingw-w64-clang-x86_64-glslang
+            mingw-w64-clang-x86_64-sdl3
+            mingw-w64-clang-x86_64-fmt
+            mingw-w64-clang-x86_64-boost
+            mingw-w64-clang-x86_64-robin-map
+            mingw-w64-clang-x86_64-xxhash
+            mingw-w64-clang-x86_64-ffmpeg
+            mingw-w64-clang-x86_64-zydis
+            mingw-w64-clang-x86_64-spirv-tools
+            mingw-w64-clang-x86_64-spirv-headers
+            mingw-w64-clang-x86_64-spirv-cross
+            mingw-w64-clang-x86_64-protobuf
+            mingw-w64-clang-x86_64-openssl
+            mingw-w64-clang-x86_64-zlib
+            mingw-w64-clang-x86_64-miniupnpc
+            mingw-w64-clang-x86_64-nlohmann-json
+
+      - name: Set up Windows Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+
+      - name: Restore GPU build cache
+        uses: actions/cache@v4
+        with:
+          path: out/gpu
+          key: ${{ runner.os }}-gpu-${{ github.ref_name }}-${{ hashFiles('gpu/CMakeLists.txt', 'build.sh', '.github/workflows/windows-build.yml') }}
+          restore-keys: |
+            ${{ runner.os }}-gpu-${{ github.ref_name }}-
+            ${{ runner.os }}-gpu-
+
+      - name: Build GPU library and Windows probes
+        run: bash build.sh
+        env:
+          BB_LTO: "OFF"
+          BB_BUILD_TYPE: "Release"
+          BB_LINK_FLAGS: "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--threads=1"
+          BB_SKIP_FG401: "1"
+          BB_TRACE: "1"
+          NINJAFLAGS: "-j1"
+
+      - name: Run launcher tests
+        run: |
+          export PYTHONPATH=tests
+          python -m unittest test_launcher_hardware
+
+      - name: Package Windows launcher
+        shell: pwsh
+        env:
+          # msys2/setup-msys2 installs MSYS2 where it decides to (a temporary directory on
+          # hosted runners, not C:\msys64, which may hold the image's own copy), so the
+          # location comes from the action rather than from a guess.
+          MSYS2_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
+        run: |
+          if (-not $env:MSYS2_LOCATION) { throw 'msys2/setup-msys2 did not report its location' }
+          $root = $env:MSYS2_LOCATION.TrimEnd('\')
+          $workspace = $env:GITHUB_WORKSPACE -replace '\\', '/'
+          if ($workspace -match '^([A-Za-z]):/(.*)$') {
+            $workspace = "/$($matches[1].ToLower())/$($matches[2])"
+          }
+          # The same directory as an MSYS2 path (D:\a\_temp\msys64 -> /d/a/_temp/msys64).
+          $msysRoot = '/' + $root.Substring(0, 1).ToLower() + ($root.Substring(2) -replace '\\', '/')
+          $env:PATH = "$root\clang64\bin;$root\usr\bin;$env:PATH"
+          $env:MSYS2_ROOT = $msysRoot
+          $env:MSYSTEM = "CLANG64"
+          & "$root\usr\bin\bash.exe" -lc "cd '$workspace' && bash packaging/windows/package.sh --zip-only" 2>&1 |
+            Tee-Object -FilePath out/windows-package.log
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
+      - name: Upload Windows launcher
+        uses: actions/upload-artifact@v4
+        with:
+          name: bloodborne-windows-launcher
+          path: |
+            dist/bbport-windows.zip
+            dist/fsr4vk-*-src.zip
+          if-no-files-found: error
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-gpu-build-log
+          path: |
+            out/gpu-build.log
+            out/windows-package.log
+          if-no-files-found: ignore
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows launcher
+        uses: actions/download-artifact@v4
+        with:
+          name: bloodborne-windows-launcher
+          path: release
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          # The Windows ZIP and the fsr4vk corresponding-source archive beside it (the
+          # provider is GPL-3.0): package.sh writes both, and SOURCE.txt names both.
+          files: |
+            release/bbport-windows.zip
+            release/fsr4vk-*-src.zip
+          generate_release_notes: true

@@ -16,13 +16,22 @@ elif [[ $# != 0 ]]; then
     echo 'Usage: bash packaging/windows/package.sh [--zip-only]' >&2
     exit 1
 fi
-[[ -f out/bb-probe.exe && -f out/bb-gpu-capabilities.exe && -f out/bb-fg401-capabilities.exe && -f out/bb-play.exe ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
+[[ -f out/bb-probe.exe && -f out/bb-gpu-capabilities.exe && -f out/bb-play.exe ]] || { echo 'Build first: bash build.sh' >&2; exit 1; }
 
 # A Windows Python (not MSYS2's) for PyInstaller, always of this minor version: it names the DLL in _internal
 # (python314.dll). 1.9.5 was frozen with 3.12 and 1.9.6 with 3.14, whichever was found first, and an installation
 # with files of both cannot start ("Failed to import encodings module"). Change it on purpose, with a release.
 PYTHON_VERSION=3.14
 python=${WINPYTHON:-}
+msys_path() {
+    local path=$1
+    path=${path//\\//}
+    if [[ $path =~ ^([A-Za-z]):/(.*)$ ]]; then
+        printf '/%s/%s' "${BASH_REMATCH[1],,}" "${BASH_REMATCH[2]}"
+    else
+        printf '%s' "$path"
+    fi
+}
 if [[ -z $python ]]; then
     folder=Python${PYTHON_VERSION/./}
     local_appdata=${LOCALAPPDATA:-/c/Users/$USER/AppData/Local}
@@ -31,6 +40,13 @@ if [[ -z $python ]]; then
                      "$local_appdata/Python/pythoncore-$PYTHON_VERSION-64/python.exe"; do
         [[ -x $candidate ]] && python=$candidate
     done
+fi
+# actions/setup-python exposes the Windows install directory through pythonLocation.
+# Convert its drive path without relying on cygpath, which is not available in
+# every shell wrapper used by hosted MSYS2 jobs.
+if [[ -z $python && -n ${pythonLocation:-} ]]; then
+    candidate="$(msys_path "$pythonLocation")/python.exe"
+    [[ -x $candidate ]] && python=$candidate
 fi
 # The Python launcher knows the versions the Python install manager put elsewhere.
 if [[ -z $python ]] && command -v py >/dev/null 2>&1; then
@@ -77,19 +93,57 @@ dest=out/stage/bbport-windows
 rm -rf -- out/stage
 mkdir -p "$dest/bin" "$dest/launcher"
 cp -r out/pyi-dist/Bloodborne/. "$dest/"
-llvm-strip -o "$dest/Play Bloodborne.exe" out/bb-play.exe
+cp out/bb-play.exe "$dest/Play Bloodborne.exe"
 cp launcher/bloodborne.ico launcher/bloodborne.png "$dest/launcher/"
-# The executables without debug information (out/ keeps the symbols for crash reports).
-for exe in bb-probe.exe bb-gpu-capabilities.exe bb-fg401-capabilities.exe; do
-    llvm-strip --strip-debug -o "$dest/bin/$exe" "out/$exe"
+# The executables are copied from out/; debug symbols remain in the build tree for crash reports.
+executables=(bb-probe.exe bb-gpu-capabilities.exe)
+if [[ -f out/bb-fg401-capabilities.exe ]]; then
+    executables+=(bb-fg401-capabilities.exe)
+fi
+for exe in "${executables[@]}"; do
+    cp "out/$exe" "$dest/bin/$exe"
 done
-# Every DLL the executables load from the CLANG64 tree (SDL3, FFmpeg, ...). Not the Vulkan loader:
-# the game uses the one the graphics driver installs in System32, as every release so far. On a PC
-# with a graphics driver ldd finds that one; a build machine without one (CI) would ship CLANG64's.
-ldd "$dest/bin/bb-probe.exe" "$dest/bin/bb-gpu-capabilities.exe" "$dest/bin/bb-fg401-capabilities.exe" |
-    awk '/\/clang64\/bin\// && !/vulkan-1\.dll/ {print $3}' | sort -u | while read -r dll; do
-        cp -u "$dll" "$dest/bin/"
+# Every DLL the executables load from the CLANG64 tree (SDL3, FFmpeg, libc++, ...) and their own
+# imports again. The imports are read from the PE headers: ldd prints nothing for PE programs here
+# (it resolves MSYS2's own ELF ones), so a ldd-based copy shipped no runtime DLLs at all. Only names
+# that exist in the CLANG64 bin directory are taken, which leaves Windows' own DLLs (kernel32,
+# d3d12, ...) to the system, and the Vulkan loader too: the game uses the one the graphics driver
+# installs in System32, as every release so far, not CLANG64's.
+clang_prefix=$msys2_root/clang64
+command -v objdump >/dev/null || {
+    echo "Need objdump from MSYS2 CLANG64 to find the runtime DLLs (packaging/windows/README.md)." >&2
+    exit 1
+}
+declare -A clang_dll=() staged_dll=()
+while IFS= read -r -d '' dll; do
+    name=${dll##*/}
+    clang_dll[${name,,}]=$dll
+done < <(find "$clang_prefix/bin" -maxdepth 1 -type f -name '*.dll' -print0)
+stage_runtime_dlls() {
+    local queue=("$@") binary name source
+    while ((${#queue[@]})); do
+        binary=${queue[0]}
+        queue=("${queue[@]:1}")
+        while IFS= read -r name; do
+            name=${name,,}
+            [[ -n ${staged_dll[$name]:-} || $name == vulkan-1.dll ]] && continue
+            source=${clang_dll[$name]:-}
+            [[ -n $source ]] || continue  # a Windows DLL, not CLANG64's to ship
+            staged_dll[$name]=$source
+            cp -u "$source" "$dest/bin/"
+            queue+=("$source")  # and whatever that DLL loads in turn
+        done < <(objdump -p "$binary" | sed -n 's/^ *DLL Name: *//p' | tr -d '\r')
     done
+}
+stage_runtime_dlls "$dest/bin/"*.exe
+# A package without them starts nowhere: fail here, not on a player's PC.
+for dll in libc++.dll libunwind.dll libwinpthread-1.dll SDL3.dll; do
+    [[ -f $dest/bin/$dll ]] || {
+        echo "Missing CLANG64 runtime DLL in the package: $dll (looked in $clang_prefix/bin)" >&2
+        exit 1
+    }
+done
+echo "Runtime DLLs beside the executables: ${#staged_dll[@]} from $clang_prefix/bin"
 cp -r scripts patches "$dest/"
 # FSR 4.1.1: the original AMD DX12 runtime, loaded dynamically beside bb-probe.exe.
 # The first build downloads AMD's SDK archive; subsequent builds verify the cached DLL.
@@ -118,8 +172,7 @@ seamless_exe=${BB_SEAMLESS_EXE:-out/bb-probe-seamless.exe}
 if [[ -f $seamless_exe && -f out/seamless/tools/party_boss_events.py ]]; then
     llvm-strip --strip-debug -o "$dest/bin/bb-probe-seamless.exe" "$seamless_exe"
     # The CLANG64 DLLs it loads besides the normal engine's (BBSC's network code: abseil's logging).
-    ldd "$dest/bin/bb-probe-seamless.exe" | awk '/\/clang64\/bin\// && !/vulkan-1\.dll/ {print $3}' | sort -u |
-        while read -r dll; do cp -u "$dll" "$dest/bin/"; done
+    stage_runtime_dlls "$dest/bin/bb-probe-seamless.exe"
     mkdir -p "$dest/seamless/tools" "$dest/seamless/scripts"
     cp out/seamless/tools/party_boss_events.py "$dest/seamless/tools/"
     cp out/seamless/scripts/hud_patch.py out/seamless/scripts/party_hud_icons.bin "$dest/seamless/scripts/"
@@ -162,7 +215,7 @@ cp launcher/assets/fonts/Inter-LICENSE.txt "$dest/licenses/Inter-OFL.txt"
 # Where the online code comes from (shadPS4 0.20, Awaken's port).
 cp gpu/bbnet/SHADNET-PORT.md "$dest/licenses/online-code-NOTICE.md"
 for package in protobuf abseil-cpp openssl miniupnpc zlib; do
-    license=/clang64/share/licenses/$package/LICENSE
+    license=$clang_prefix/share/licenses/$package/LICENSE
     if [[ -f $license ]]; then cp "$license" "$dest/licenses/$package-LICENSE.txt"; fi
 done
 find "$dest" -name __pycache__ -prune -exec rm -r {} +

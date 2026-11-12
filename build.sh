@@ -2,6 +2,9 @@
 set -euo pipefail
 cd -- "$(dirname -- "$0")"
 mkdir -p out
+if [[ ${BB_TRACE:-0} == 1 ]]; then
+    set -x
+fi
 # Windows: MSYS2 CLANG64 (packages in packaging/windows/README.md). The GPU library is static
 # there and CMake links bb-probe.exe as well; no PGO (GCC-only flags), LTO off by default.
 case $(uname -s) in
@@ -20,14 +23,34 @@ MINGW*|MSYS*)
             git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
         fi
     done
-    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO=off \
-        -DBB_LTO="${BB_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ >/dev/null
+    cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE="${BB_BUILD_TYPE:-RelWithDebInfo}" -DBB_PGO=off \
+        -DBB_LTO="${BB_LTO:-OFF}" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+        ${BB_LINK_FLAGS:-} >/dev/null
     echo "GPU library and loader: LTO ${BB_LTO:-OFF}"
-    if ! ninja -C out/gpu bb-probe bb-gpu-capabilities bb-fg401-capabilities bb-play > out/gpu-build.log 2>&1; then
-        grep -v '^\[' out/gpu-build.log | tail -40 >&2
-        echo 'Build failed (full log: out/gpu-build.log)' >&2; exit 1
+    targets=(bb-probe bb-gpu-capabilities bb-play)
+    if [[ ${BB_SKIP_FG401:-0} != 1 ]]; then
+        targets+=(bb-fg401-capabilities)
     fi
-    cp out/gpu/bb-probe.exe out/gpu/bb-gpu-capabilities.exe out/gpu/bb-fg401-capabilities.exe out/gpu/bb-play.exe out/
+    : > out/gpu-build.log
+    for target in "${targets[@]}"; do
+        if ! ninja -C out/gpu "$target" >> out/gpu-build.log 2>&1; then
+            grep -v '^\[' out/gpu-build.log | tail -40 >&2
+            echo "Build failed at $target (full log: out/gpu-build.log)" >&2
+            exit 1
+        fi
+    done
+    for executable in bb-probe.exe bb-gpu-capabilities.exe bb-play.exe; do
+        cmake -E copy_if_different "out/gpu/$executable" "out/$executable"
+    done
+    if [[ ${BB_SKIP_FG401:-0} != 1 ]]; then
+        cmake -E copy_if_different out/gpu/bb-fg401-capabilities.exe out/bb-fg401-capabilities.exe
+    fi
+    for executable in bb-probe.exe bb-gpu-capabilities.exe bb-play.exe; do
+        [[ -f out/$executable ]] || {
+            echo "Build output missing: out/$executable" >&2
+            exit 1
+        }
+    done
     echo "Built $PWD/out/bb-probe.exe"
     exit 0
     ;;
@@ -69,7 +92,7 @@ for patch in gpu/patches/fsr-vulkan/*.patch; do
         git -C gpu/third_party/fsr-vulkan apply "$PWD/$patch"
     fi
 done
-cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DBB_PGO="$pgo" \
+cmake -S gpu -B out/gpu -G Ninja -DCMAKE_BUILD_TYPE="${BB_BUILD_TYPE:-RelWithDebInfo}" -DBB_PGO="$pgo" \
     -DBB_LTO="${BB_LTO:-ON}" -DBB_PGO_DIR="$PWD/pgo" >/dev/null
 echo "GPU library: PGO $pgo, LTO ${BB_LTO:-ON}"
 # A failed GPU build must stop here: an older libbbgpu.so would otherwise be used silently.

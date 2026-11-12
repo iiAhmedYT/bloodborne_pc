@@ -325,7 +325,7 @@ class PackageTests(unittest.TestCase):
         new, old = script.index('out/bb-probe-seamless.exe'), script.index('out/bbsc/bbsc-launch.exe')
         self.assertLess(new, old)
         self.assertIn('llvm-strip --strip-debug -o "$dest/bin/bb-probe-seamless.exe" "$seamless_exe"', script)
-        self.assertIn('ldd "$dest/bin/bb-probe-seamless.exe"', script)  # its own DLLs (abseil's logging)
+        self.assertIn('stage_runtime_dlls "$dest/bin/bb-probe-seamless.exe"', script)  # its own DLLs (abseil's logging)
         self.assertIn('elif [[ -f out/bbsc/bbsc-launch.exe ]]', script)
 
     def test_the_package_takes_named_files_from_bbscs_release_only(self):

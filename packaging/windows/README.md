@@ -35,6 +35,26 @@ ZIP from fresh staging files and leaves an existing playable
 Both modes also write `dist/fsr4vk-v0.4.3-amdfix-src.zip`. Publish this
 corresponding-source archive alongside `dist/bbport-windows.zip`.
 
+GitHub Actions runs the same GPU build in an MSYS2 CLANG64 environment from
+[`.github/workflows/windows-build.yml`](../../.github/workflows/windows-build.yml).
+It builds with `BB_LTO=OFF`, `BB_BUILD_TYPE=Release`, and skips the optional FG401
+capability probe to keep CI memory usage predictable, then runs the launcher
+hardware tests and uploads `bbport-windows.zip` with the corresponding-source ZIP
+as downloadable workflow artifacts. Pushing a version tag such as `v1.9.8.5` also
+publishes both as public GitHub Release assets. The packaging step takes the MSYS2
+installation from `msys2/setup-msys2` (`msys2-location`, a temporary directory on
+hosted runners, not `C:\msys64`) and leaves its output in `out/windows-package.log`.
+The package script also resolves the Windows Python installation exported by
+`actions/setup-python` without relying on MSYS2 path-conversion commands.
+
+The runtime DLLs in `bin\` are found by reading the imports of the packaged
+executables with `objdump` and copying the CLANG64 files of those names,
+recursively (a DLL's own imports included). `ldd` is not used: it prints nothing
+for PE programs here, which shipped a package that started nowhere. `vulkan-1.dll`
+stays the graphics driver's, and the script stops with an error rather than writing
+a ZIP whose `bin\` lacks `libc++.dll`, `libunwind.dll`, `libwinpthread-1.dll` or
+`SDL3.dll`.
+
 `run.py` is the Windows `run.sh` (same variables; works from a plain Windows Python too).
 The FSR 4.1 integration initializes installed-driver discovery for the GUI,
 `--run` and direct `run.py` starts; see [FSR 4.1 on Windows](../../docs/FSR41_WINDOWS.md).
