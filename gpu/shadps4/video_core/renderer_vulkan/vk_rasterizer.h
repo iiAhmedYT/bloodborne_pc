@@ -131,6 +131,12 @@ public:
     Occlusion* GetOcclusion() const noexcept {
         return occlusion.get();
     }
+    /// A write the CPU makes into guest memory after the command that ordered it (an occlusion
+    /// dump resolved when the GPU is past it): the recording side must not assume it saw the
+    /// guest's latest bytes.
+    void NoteLateCommandWrite(VAddr address, const void*, u64 size) {
+        NotePendingGpuWrite(address, size);
+    }
     void NoteIssuedDraw() {
         if (occlusion) {
             occlusion->NoteIssued();

@@ -29,6 +29,7 @@
 #include "video_core/renderdoc.h"
 #include "video_core/renderer_vulkan/vk_rasterizer.h"
 #include "video_core/renderer_vulkan/vk_occlusion.h"
+#include "bbport_threads.h"
 
 namespace AmdGpu {
 
@@ -112,6 +113,7 @@ void Liverpool::ProcessCommands() {
 
 void Liverpool::Process(std::stop_token stoken) {
     Common::SetCurrentThreadName("shadPS4:GpuCommandProcessor");
+    BbThreads::RaiseRenderPriority();
 #ifndef _WIN32
     if (clockid_t clock; pthread_getcpuclockid(pthread_self(), &clock) == 0) {
         BbStats::gpu_thread_clock.store(static_cast<int>(clock));
@@ -186,6 +188,7 @@ void Liverpool::Process(std::stop_token stoken) {
         // heap free list after minutes of play).
         // The same holds when sceGnmSubmitDone finds the GPU idle and does not block at all:
         // decoded (num_submits 0) is not done until then (work_retired).
+        BbStats::submit_done_calls.fetch_add(1, std::memory_order_relaxed);
         if (rasterizer) {
             rasterizer->DrainDrawPipe(Vulkan::DrawPipe::ReasonSubmissionEnd);
             rasterizer->WaitDeferredSignals();
@@ -239,6 +242,7 @@ bool PipelinedOpcode(PM4ItOpcode opcode) {
     case PM4ItOpcode::DispatchIndirect:
     case PM4ItOpcode::WriteData:     // run in order on the recording thread (RunInOrder)
     case PM4ItOpcode::DmaData:
+    case PM4ItOpcode::SetPredication: // likewise, and only the recording side tracks it
         return true;
     default:
         return false;
@@ -360,18 +364,17 @@ void RunZpassDump(Vulkan::Rasterizer& rasterizer, const u8* data) {
     for (u32 i = 0; i < dump.pairs; ++i, results += 2) {
         *results = dump.value;
     }
+}
 
-    void RunOcclusionDump(Vulkan::Rasterizer& rasterizer, const u8* data) {
-        if (auto* occlusion = rasterizer.GetOcclusion()) {
-            occlusion->Dump(*reinterpret_cast<const Vulkan::Occlusion::DumpTask*>(data));
-        }
+void RunOcclusionDump(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    if (auto* occlusion = rasterizer.GetOcclusion()) {
+        occlusion->Dump(*reinterpret_cast<const Vulkan::Occlusion::DumpTask*>(data));
     }
+}
 
-    void RunSetPredication(Vulkan::Rasterizer& rasterizer, const u8* data) {
-        if (auto* occlusion = rasterizer.GetOcclusion()) {
-            occlusion->SetPredication(
-                *reinterpret_cast<const Vulkan::Occlusion::PredicationTask*>(data));
-        }
+void RunSetPredication(Vulkan::Rasterizer& rasterizer, const u8* data) {
+    if (auto* occlusion = rasterizer.GetOcclusion()) {
+        occlusion->SetPredication(*reinterpret_cast<const Vulkan::Occlusion::PredicationTask*>(data));
     }
 }
 

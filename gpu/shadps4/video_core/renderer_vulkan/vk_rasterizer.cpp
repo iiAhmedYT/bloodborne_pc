@@ -1166,24 +1166,24 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     }
     SetProjectionJitter(push_data, regs, draw_jitter);
     pipeline->BindResources(set_writes, push_data);
+    // bbport: a draw SET_PREDICATION hides is not recorded at all (vk_occlusion.h). Before the
+    // pass is opened: nothing is bound for it, and no empty pass is left for the next draw.
+    if (occlusion && occlusion->SkipDraw()) {
+        ResetBindings(false);
+        return;
+    }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
-
-    Occlusion::DrawQuery query{};
-    if (occlusion) {
-        if (occlusion->SkipDraw()) {
-            ResetBindings(false);
-            return;
-        }
-        query = occlusion->BeginDraw(push_data.scene_size);
-    }
 
     const vk::Pipeline handle = pipeline->Handle();
     const u32 num_indices = regs.num_indices;
     const u32 num_instances = regs.num_instances.NumInstances();
     const u32 first_vertex = vertex_offset;
     const u32 first_instance = instance_offset;
+    // bbport: measured by an occlusion query around just this draw (vk_occlusion.h).
+    const auto query =
+        occlusion ? occlusion->BeginDraw(push_data.scene_size) : Occlusion::DrawQuery{};
     const auto* marked_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const u32 checkpoint = Checkpoints::Note("draw vs/ps/indices", vs_info.pgm_hash,
                                        marked_ps ? marked_ps->pgm_hash : 0, num_indices);
@@ -1316,18 +1316,14 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     }
     SetProjectionJitter(push_data, Regs(), draw_jitter);
     pipeline->BindResources(set_writes, push_data);
+    // bbport: as in DrawRecord: skipped before the pass is opened.
+    if (occlusion && occlusion->SkipDraw()) {
+        ResetBindings(false);
+        return;
+    }
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
-
-    Occlusion::DrawQuery query{};
-    if (occlusion) {
-        if (occlusion->SkipDraw()) {
-            ResetBindings(false);
-            return;
-        }
-        query = occlusion->BeginDraw(push_data.scene_size);
-    }
 
     ASSERT(stride == (is_indexed ? sizeof(VkDrawIndexedIndirectCommand)
                                  : sizeof(VkDrawIndirectCommand)));
@@ -1336,6 +1332,9 @@ void Rasterizer::DrawIndirectRecord(const GraphicsPipeline* pipeline, bool is_in
     const u64 args_offset = base;
     const vk::Buffer counts = count_address != 0 ? count_buffer->Handle() : vk::Buffer{};
     const u64 counts_offset = count_address != 0 ? count_offset : 0;
+    // bbport: measured by an occlusion query around just this draw (vk_occlusion.h).
+    const auto query =
+        occlusion ? occlusion->BeginDraw(push_data.scene_size) : Occlusion::DrawQuery{};
     const auto* marked_ps = pipeline->GetStages()[u32(Shader::SwStage::Fragment)];
     const u32 checkpoint = Checkpoints::Note("draw indirect vs/ps/count",
                                        pipeline->GetStage(Shader::SwStage::Vertex).pgm_hash,
