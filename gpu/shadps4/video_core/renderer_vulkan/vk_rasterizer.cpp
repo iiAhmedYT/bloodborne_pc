@@ -1043,15 +1043,19 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         runtime.FlushBarriers();
     }
 
+    // bbport: the vertex stage and the fetch shader's vertex/instance offsets: the object-motion
+    // gate below needs them before the draw, and the draw call needs them again after it. Read
+    // once here (the gate used to compute them a second time on every motion draw).
+    const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
+    const auto& fetch_shader = pipeline->GetFetchShader();
+    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
+
     // bbport: screen-space (clip disabled) draws into the upscaler's output-size images.
     push_data.xscale *= target_scale[0];
     push_data.xoffset *= target_scale[0];
     push_data.yscale *= target_scale[1];
     push_data.yoffset *= target_scale[1];
     if (motion_draw && motion_geometry) {
-        const auto& vs = pipeline->GetStage(Shader::SwStage::Vertex);
-        const auto [base_vertex, first_instance] =
-            GetDrawOffsets(regs, vs, pipeline->GetFetchShader());
         const u32 index_size =
             regs.index_buffer_type.index_type == AmdGpu::IndexType::Index16 ? 2u : 4u;
         const VAddr index_address = is_indexed
@@ -1066,11 +1070,11 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         bool gated = !all_motion;
         bool small = false; // a small-skeleton palette was found and hashed
         u64 palette = 0;
-        for (u32 i = 0; i < vs.buffers.size(); ++i) {
-            const auto& resource = vs.buffers[i];
+        for (u32 i = 0; i < vs_info.buffers.size(); ++i) {
+            const auto& resource = vs_info.buffers[i];
             if (resource.IsSpecial()) continue;
             const auto buffer =
-                vs_prepared ? vs_prepared->buffer_sharps[i] : resource.GetSharp(vs);
+                vs_prepared ? vs_prepared->buffer_sharps[i] : resource.GetSharp(vs_info);
             const u32 size = buffer.GetSize();
             if (!buffer.Valid() || buffer.GetStride() != 16) continue;
             const auto role = Motion::ClassifyBuffer(size);
@@ -1096,19 +1100,19 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
         bool moved = !gated;
         if (!moved) {
             if (small) {
-                moved = object_motion->Moving({.shader = vs.pgm_hash,
+                moved = object_motion->Moving({.shader = vs_info.pgm_hash,
                                                .geometry = motion_geometry,
                                                .indices = index_address,
                                                .index_count = regs.num_indices,
                                                .instances = regs.num_instances.NumInstances(),
-                                               .first_instance = first_instance},
+                                               .first_instance = instance_offset},
                                               palette);
             } else {
                 object_motion->Still();
             }
         }
         if (moved) {
-            Motion::VertexRange range{base_vertex, regs.num_indices};
+            Motion::VertexRange range{vertex_offset, regs.num_indices};
             u64 topology = 0;
             if (is_indexed) {
                 range = {};
@@ -1118,16 +1122,16 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                     const bool restart = regs.enable_primitive_restart != 0;
                     const u32 count = regs.num_indices;
                     const auto scanned = object_motion->IndexRange(
-                        {index_address, count, index_size, s32(base_vertex), restart}, [&] {
+                        {index_address, count, index_size, s32(vertex_offset), restart}, [&] {
                             const auto* data = reinterpret_cast<const void*>(index_address);
                             const auto scan_range =
                                 index_size == 2
                                     ? Motion::IndexedRange(
                                           std::span(static_cast<const u16*>(data), count),
-                                          s32(base_vertex), restart)
+                                          s32(vertex_offset), restart)
                                     : Motion::IndexedRange(
                                           std::span(static_cast<const u32*>(data), count),
-                                          s32(base_vertex), restart);
+                                          s32(vertex_offset), restart);
                             return Motion::IndexRangeCache::Result{scan_range,
                                                                    XXH3_64bits(data, bytes)};
                         });
@@ -1136,13 +1140,13 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
                 }
             }
             push_data.motion_param = object_motion->PrepareDraw({
-                .shader = vs.pgm_hash,
+                .shader = vs_info.pgm_hash,
                 .geometry = motion_geometry,
                 .indices = index_address,
                 .topology = topology,
                 .index_count = regs.num_indices,
                 .instances = regs.num_instances.NumInstances(),
-                .first_instance = first_instance,
+                .first_instance = instance_offset,
                 .vertices = range,
             });
         }
@@ -1159,10 +1163,6 @@ void Rasterizer::DrawRecord(const GraphicsPipeline* pipeline, const PreparedDraw
     UpdateDynamicState(pipeline, is_indexed);
     MarkPass(pipeline, state);
     scheduler.BeginRendering(state);
-
-    const auto& vs_info = pipeline->GetStage(Shader::SwStage::Vertex);
-    const auto& fetch_shader = pipeline->GetFetchShader();
-    const auto [vertex_offset, instance_offset] = GetDrawOffsets(regs, vs_info, fetch_shader);
 
     const vk::Pipeline handle = pipeline->Handle();
     const u32 num_indices = regs.num_indices;
@@ -2311,8 +2311,7 @@ Rasterizer::ImageDescCacheEntry& Rasterizer::CachedImageDescEntry(const AmdGpu::
     }
     slot->last_use = ++desc_use_counter;
     auto& entry = *slot;
-    if (entry.flags != flags || entry.sharp != key ||
-        BbToggle::Disabled(BbToggle::ImageDescCache)) {
+    if (disabled || entry.flags != flags || entry.sharp != key) {
         entry.desc = VideoCore::TextureCache::ImageDesc{sharp, res};
         entry.sharp = key;
         entry.flags = flags;
@@ -2356,13 +2355,13 @@ void Rasterizer::BindTextures(const Shader::Info& stage, const PreparedStage* pr
     boost::container::small_vector<bool, 16> binding_proxy_ok;
     const bool sample_proxies = !BbToggle::Disabled(BbToggle::SampleSceneProxies) &&
                                 !on_helper && scene_targets->Reduced();
+    // bbport: a hash lookup per texture for a diagnostic only.
+    static const bool warn_meta = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
 
     for (u32 image_index = 0; image_index < stage.images.size(); ++image_index) {
         const auto& image_desc = stage.images[image_index];
         const auto tsharp =
             prepared ? prepared->image_sharps[image_index] : image_desc.GetSharp(stage);
-        // bbport: a hash lookup per texture per draw for a diagnostic only.
-        static const bool warn_meta = std::getenv("BB_WARN_META_TEXTURE") != nullptr;
         if (warn_meta && texture_cache.IsMeta(tsharp.Address())) {
             LOG_WARNING(Render_Vulkan, "Unexpected metadata read by a shader (texture)");
         }
@@ -2689,15 +2688,15 @@ bool Rasterizer::BindTexturesFromSet(const Shader::Info& stage, const PreparedSt
         return false;
     }
     // Every image still has the backing its view belongs to and needs no refresh.
+    // Proxy entries need a current proxy; native entries of a proxied image go through
+    // BindTextures, which may sample the proxy instead.
+    const bool proxies_on = !BbToggle::Disabled(BbToggle::SampleSceneProxies);
     for (u32 i = 0; i < count; ++i) {
         const auto& entry = set.entries[i];
         if (!entry.id) {
             continue;
         }
         const auto& image = texture_cache.GetImage(entry.id);
-        // Proxy entries need a current proxy; native entries of a proxied image go through
-        // BindTextures, which may sample the proxy instead.
-        const bool proxies_on = !BbToggle::Disabled(BbToggle::SampleSceneProxies);
         if (image.backing != entry.backing || image.binding.needs_rebind ||
             image.binding.is_target || !texture_cache.IsUpToDate(entry.id) ||
             (entry.proxy ? !proxies_on ||
