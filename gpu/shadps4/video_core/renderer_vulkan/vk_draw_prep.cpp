@@ -485,8 +485,26 @@ void DrawPreparation::WorkerLoop(std::stop_token stop, u32 index) {
     }
 }
 
-void DrawPreparation::Count(bool was_used) {
+void DrawPreparation::Count(bool was_used, u32 state, bool checksum_matches) {
     ++(was_used ? used : unused);
+    if (!was_used) {
+        // bbport: why the prepared draw went unused, so one log line says which of the four
+        // lessons to draw. `Pending`: no worker reached it (they gave up once the GPU thread
+        // was past the submission, or they are behind). `Unavailable`: a worker looked and its
+        // selection failed (tessellation is never prepared; a bailing surface format).
+        // `stale`: ready, but the registers moved on since. `unusable`: ready with the same
+        // registers, and the selection still turned it down (a stage's user data or the
+        // pipeline lookup).
+        if (state == PreparedDraw::Pending) {
+            ++pending;
+        } else if (state != PreparedDraw::Ready) {
+            ++unavailable;
+        } else if (!checksum_matches) {
+            ++stale;
+        } else {
+            ++unusable;
+        }
+    }
     static const bool stats = std::getenv("BB_FRAME_STATS") != nullptr;
     // The clock is read every 1024 draws: per draw it was 8% of the GPU thread.
     if (!stats || ((used + unused) & 1023) != 0) {
@@ -498,11 +516,16 @@ void DrawPreparation::Count(bool was_used) {
         return;
     }
     window = now;
-    std::printf("Draw preparation: %llu prepared pipelines used, %llu not (%u workers, "
+    std::printf("Draw preparation: %llu prepared pipelines used, %llu not (%llu pending, "
+                "%llu unavailable, %llu stale registers, %llu turned down) (%u workers, "
                 "%llu scanner rebases)\n",
                 static_cast<unsigned long long>(used), static_cast<unsigned long long>(unused),
-                worker_count, static_cast<unsigned long long>(rebases));
-    used = unused = 0;
+                static_cast<unsigned long long>(pending),
+                static_cast<unsigned long long>(unavailable),
+                static_cast<unsigned long long>(stale),
+                static_cast<unsigned long long>(unusable), worker_count,
+                static_cast<unsigned long long>(rebases));
+    used = unused = pending = unavailable = stale = unusable = 0;
 }
 
 } // namespace Vulkan

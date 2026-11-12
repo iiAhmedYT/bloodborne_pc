@@ -117,7 +117,8 @@ public:
     const PreparedDraw* NextDraw();
 
     /// GPU thread: counts whether a prepared draw was used; prints every 5 s (BB_FRAME_STATS).
-    void Count(bool used);
+    /// `state` and `checksum_matches` split the unused ones by cause (see Count in the .cpp).
+    void Count(bool was_used, u32 state, bool checksum_matches);
 
     struct Submission {
         u64 seq{};
@@ -164,6 +165,8 @@ public:
 private:
     u32 current_draw = 0;
     u64 used = 0, unused = 0;
+    /// bbport: the unused ones by cause (BB_FRAME_STATS).
+    u64 pending = 0, unavailable = 0, stale = 0, unusable = 0;
     u32 worker_count = 0; ///< fixed before the worker threads start
     std::jthread scanner;
     std::vector<std::jthread> workers;
